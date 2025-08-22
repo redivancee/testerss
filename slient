@@ -3,8 +3,12 @@ local CollectionService = game:GetService("CollectionService")
 local UserInputService = game:GetService("UserInputService")
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
+local CoreGui = game:GetService("CoreGui")
 
 local player = Players.LocalPlayer
+
+-- MASTER TOGGLE STATE
+local masterEnabled = false
 
 -- DISABLE ORIGINAL GUN MODULE TO PREVENT DOUBLE BULLETS
 local function removeGunController(obj)
@@ -40,64 +44,123 @@ local shootRemote = ReplicatedStorage.Remotes.ShootGun
 local maid = Maid.new()
 local lastShot = nil
 
--- Silent Aim Config
-local silentAim = {
-    enabled = true,
-    fov = 150,
-    teamCheck = false,
-    wallCheck = true,
-    targetPart = "Head" -- Head, HumanoidRootPart, Torso
-}
+-- Target System
+local selectedTarget = nil
 
--- Get closest target
-local function getClosestTarget()
-    if not silentAim.enabled then return nil end
+-- ESP Storage
+local skeletons = {}
 
-    local closestTarget = nil
-    local closestDistance = math.huge
+-- Simple Skeleton ESP Functions
+local function createSkeleton(character)
+    local skeleton = {}
+    skeleton.lines = {}
+    skeleton.character = character
+    skeleton.player = Players:GetPlayerFromCharacter(character)
+    
+    -- Only essential connections for better performance
+    local connections = {
+        {"Head", "UpperTorso"},
+        {"UpperTorso", "LowerTorso"},
+        {"UpperTorso", "LeftUpperArm"},
+        {"UpperTorso", "RightUpperArm"},
+        {"LowerTorso", "LeftUpperLeg"},
+        {"LowerTorso", "RightUpperLeg"}
+    }
+    
+    for _, connection in pairs(connections) do
+        local line = Drawing.new("Line")
+        line.Color = Color3.fromRGB(255, 0, 0)
+        line.Thickness = 2
+        line.Visible = false
+        skeleton.lines[#skeleton.lines + 1] = {line = line, parts = connection}
+    end
+    
+    return skeleton
+end
+
+local function updateSkeleton(skeleton)
+    if not masterEnabled or not skeleton.character or not skeleton.character.Parent then
+        for _, data in pairs(skeleton.lines) do
+            data.line.Visible = false
+        end
+        return
+    end
+    
+    local character = skeleton.character
+    local humanoidRootPart = character:FindFirstChild("HumanoidRootPart")
+    
+    if not humanoidRootPart then
+        for _, data in pairs(skeleton.lines) do
+            data.line.Visible = false
+        end
+        return
+    end
+    
+    -- Hide skeleton if too far
+    local distance = (humanoidRootPart.Position - camera.CFrame.Position).Magnitude
+    if distance > 500 then
+        for _, data in pairs(skeleton.lines) do
+            data.line.Visible = false
+        end
+        return
+    end
+    
+    for _, data in pairs(skeleton.lines) do
+        local part1 = character:FindFirstChild(data.parts[1])
+        local part2 = character:FindFirstChild(data.parts[2])
+        
+        if part1 and part2 then
+            local pos1, onScreen1 = camera:WorldToViewportPoint(part1.Position)
+            local pos2, onScreen2 = camera:WorldToViewportPoint(part2.Position)
+            
+            -- Only show if both points are reasonably on screen
+            if onScreen1 and onScreen2 and pos1.Z > 0 and pos2.Z > 0 then
+                data.line.From = Vector2.new(pos1.X, pos1.Y)
+                data.line.To = Vector2.new(pos2.X, pos2.Y)
+                data.line.Visible = true
+            else
+                data.line.Visible = false
+            end
+        else
+            data.line.Visible = false
+        end
+    end
+end
+
+local function removeSkeleton(skeleton)
+    if skeleton then
+        for _, data in pairs(skeleton.lines) do
+            data.line:Remove()
+        end
+    end
+end
+
+-- Get nearest player to mouse click
+local function getNearestPlayerToMouse()
     local mousePos = UserInputService:GetMouseLocation()
+    local closestPlayer = nil
+    local closestDistance = math.huge
 
     for _, target in pairs(Players:GetPlayers()) do
         if target ~= player and target.Character and target.Character:FindFirstChild("HumanoidRootPart") then
-            if silentAim.teamCheck and target.Team == player.Team then
-                -- skip teammates
-            else
-                local targetPart = target.Character:FindFirstChild(silentAim.targetPart) or target.Character.HumanoidRootPart
-                local screenPos, onScreen = camera:WorldToViewportPoint(targetPart.Position)
-
-                if onScreen then
-                    local distance = (Vector2.new(screenPos.X, screenPos.Y) - mousePos).Magnitude
-                    local fovDistance = (targetPart.Position - camera.CFrame.Position).Magnitude
-
-                    if distance < silentAim.fov and fovDistance < closestDistance then
-                        if silentAim.wallCheck then
-                            local raycastParams = RaycastParams.new()
-                            raycastParams.FilterType = Enum.RaycastFilterType.Blacklist
-                            raycastParams.FilterDescendantsInstances = {player.Character}
-
-                            local raycast = workspace:Raycast(camera.CFrame.Position,
-                                (targetPart.Position - camera.CFrame.Position).Unit * 1000, raycastParams)
-
-                            if raycast and raycast.Instance and raycast.Instance:IsDescendantOf(target.Character) then
-                                closestTarget = targetPart
-                                closestDistance = fovDistance
-                            end
-                        else
-                            closestTarget = targetPart
-                            closestDistance = fovDistance
-                        end
-                    end
+            local screenPos, onScreen = camera:WorldToViewportPoint(target.Character.HumanoidRootPart.Position)
+            
+            if onScreen then
+                local distance = (Vector2.new(screenPos.X, screenPos.Y) - mousePos).Magnitude
+                if distance < closestDistance then
+                    closestPlayer = target
+                    closestDistance = distance
                 end
             end
         end
     end
 
-    return closestTarget
+    return closestPlayer
 end
 
--- Modified shoot function with silent aim
+-- Modified shoot function
 local function silentShoot(tool, targetPos)
-    if not tool or not tool.Enabled then return end
+    if not masterEnabled or not tool or not tool.Enabled then return end
     if lastShot and tool:GetAttribute("Cooldown") and tick() - lastShot < tool:GetAttribute("Cooldown") then return end
 
     local muzzle = tool:FindFirstChild("Muzzle", true)
@@ -105,15 +168,14 @@ local function silentShoot(tool, targetPos)
 
     lastShot = tick()
 
-    local silentTarget = nil
-    if silentAim.enabled then
-        local target = getClosestTarget()
-        if target then
-            silentTarget = target.Position
-        end
+    local finalTarget = targetPos
+    if selectedTarget and selectedTarget.Character and selectedTarget.Character:FindFirstChild("Head") then
+        finalTarget = selectedTarget.Character.Head.Position
     end
-
-    local finalTarget = silentTarget or targetPos or (mouse.Hit and mouse.Hit.Position or (camera.CFrame.Position + camera.CFrame.LookVector * 2000))
+    
+    if not finalTarget then
+        finalTarget = mouse.Hit and mouse.Hit.Position or (camera.CFrame.Position + camera.CFrame.LookVector * 2000)
+    end
 
     local screenRay = WeaponRaycast(camera.CFrame.Position, finalTarget, nil, CollisionGroups.SCREEN_RAYCAST)
     local characterRay = CharacterRayOrigin(character)
@@ -144,8 +206,24 @@ local function silentShoot(tool, targetPos)
     end
 end
 
+local function addSkeletonForPlayer(targetPlayer)
+    if not masterEnabled then return end
+    if targetPlayer.Character and not skeletons[targetPlayer] then
+        local skeleton = createSkeleton(targetPlayer.Character)
+        skeletons[targetPlayer] = skeleton
+    end
+end
+
+local function removeSkeletonForPlayer(targetPlayer)
+    if skeletons[targetPlayer] then
+        removeSkeleton(skeletons[targetPlayer])
+        skeletons[targetPlayer] = nil
+    end
+end
+
 -- Tool handler
 local function handleTool(tool)
+    if not masterEnabled then return end
     if tool:IsA("Tool") and CollectionService:HasTag(tool, Tags.GUN_TOOL) then
         maid:DoCleaning()
 
@@ -155,10 +233,12 @@ local function handleTool(tool)
             end
         end))
 
-        -- Mouse input
+        -- Mouse input with target selection
         maid:GiveTask(UserInputService.InputBegan:Connect(function(input, gameProcessed)
             if gameProcessed then return end
             if input.UserInputType == Enum.UserInputType.MouseButton1 or input.KeyCode == Enum.KeyCode.ButtonR2 then
+                -- Select nearest target on click
+                selectedTarget = getNearestPlayerToMouse()
                 silentShoot(tool)
             end
         end))
@@ -166,335 +246,179 @@ local function handleTool(tool)
         -- Touch input
         maid:GiveTask(UserInputService.TouchTapInWorld:Connect(function(position, gameProcessed)
             if gameProcessed then return end
+            selectedTarget = getNearestPlayerToMouse()
             local worldPos = WeaponRaycast.convertScreenPointToVector3(position, 2000)
             silentShoot(tool, worldPos)
         end))
     end
 end
 
-character.ChildAdded:Connect(handleTool)
+local function onCharacterAdded(newCharacter, targetPlayer)
+    if masterEnabled then
+        addSkeletonForPlayer(targetPlayer)
+    end
+    newCharacter.AncestryChanged:Connect(function(_, parent)
+        if not parent then
+            removeSkeletonForPlayer(targetPlayer)
+        end
+    end)
+end
+
+-- Player connections
+Players.PlayerAdded:Connect(function(targetPlayer)
+    targetPlayer.CharacterAdded:Connect(function(newCharacter)
+        onCharacterAdded(newCharacter, targetPlayer)
+    end)
+end)
+
+Players.PlayerRemoving:Connect(function(targetPlayer)
+    removeSkeletonForPlayer(targetPlayer)
+    if selectedTarget == targetPlayer then
+        selectedTarget = nil
+    end
+end)
+
+-- Handle existing players
+for _, pl in pairs(Players:GetPlayers()) do
+    if pl ~= player then
+        if pl.Character then
+            if masterEnabled then
+                addSkeletonForPlayer(pl)
+            end
+        end
+        pl.CharacterAdded:Connect(function(newCharacter)
+            onCharacterAdded(newCharacter, pl)
+        end)
+    end
+end
+
+-- Handle character respawning
+character.ChildAdded:Connect(function(child)
+    if masterEnabled then
+        handleTool(child)
+    end
+end)
+
 for _, child in pairs(character:GetChildren()) do
-    handleTool(child)
+    if masterEnabled then
+        handleTool(child)
+    end
 end
 
 player.CharacterAdded:Connect(function(newChar)
     character = newChar
     maid:DoCleaning()
 
-    character.ChildAdded:Connect(handleTool)
+    character.ChildAdded:Connect(function(child)
+        if masterEnabled then
+            handleTool(child)
+        end
+    end)
     for _, child in pairs(character:GetChildren()) do
-        handleTool(child)
+        if masterEnabled then
+            handleTool(child)
+        end
     end
 end)
 
-local Players = game:GetService("Players")
-local RunService = game:GetService("RunService")
-local CoreGui = game:GetService("CoreGui")
-local LocalPlayer = Players.LocalPlayer
-
-local highlights = {}
-
-local function createHighlight(character)
-    local highlight = Instance.new("Highlight")
-    highlight.Name = "RainbowESP"
-    highlight.OutlineColor = Color3.new(0, 0, 0)
-    highlight.Adornee = character
-    highlight.Parent = CoreGui
-    return highlight
-end
-
-local function addHighlightForPlayer(player)
-    if player.Character and not highlights[player] then
-        if player.Team == LocalPlayer.Team then return end
-        local hl = createHighlight(player.Character)
-        highlights[player] = hl
-    end
-end
-
-local function removeHighlightForPlayer(player)
-    if highlights[player] then
-        highlights[player]:Destroy()
-        highlights[player] = nil
-    end
-end
-
-for player, hl in pairs(highlights) do
-    if hl and hl.Parent then
-        hl.FillColor = Color3.fromRGB(255, 0, 0) -- solid red color
-        hl.OutlineColor = Color3.fromRGB(0, 0, 0) -- black outline or any color you prefer
-    else
-        highlights[player] = nil
-    end
-end
-
-
-local function onCharacterAdded(character, player)
-    addHighlightForPlayer(player)
-    character.AncestryChanged:Connect(function(_, parent)
-        if not parent then
-            removeHighlightForPlayer(player)
-        end
-    end)
-end
-
-Players.PlayerAdded:Connect(function(player)
-    player.CharacterAdded:Connect(function(character)
-        onCharacterAdded(character, player)
-    end)
-end)
-
-Players.PlayerRemoving:Connect(removeHighlightForPlayer)
-
-for _, pl in pairs(Players:GetPlayers()) do
-    if pl ~= LocalPlayer then
-        if pl.Character then
-            addHighlightForPlayer(pl)
-        end
-        pl.CharacterAdded:Connect(function(character)
-            onCharacterAdded(character, pl)
-        end)
-    end
-end
-
--- MINI GUI
+-- SUPER SIMPLE GUI
 local screenGui = Instance.new("ScreenGui")
-screenGui.Name = "SilentAimMini"
+screenGui.Name = "CheatGUI"
 screenGui.ResetOnSpawn = false
 screenGui.Parent = player:WaitForChild("PlayerGui")
 
-local main = Instance.new("Frame")
-main.Name = "Main"
-main.Size = UDim2.new(0, 180, 0, 110)
-main.Position = UDim2.new(0, 10, 0, 10)
-main.BackgroundColor3 = Color3.fromRGB(20, 20, 20)
-main.BorderSizePixel = 0
-main.Parent = screenGui
+local toggle = Instance.new("TextButton")
+toggle.Size = UDim2.new(0, 120, 0, 40)
+toggle.Position = UDim2.new(0, 10, 0, 10)
+toggle.BackgroundColor3 = Color3.fromRGB(255, 0, 0)
+toggle.Text = "OFF"
+toggle.TextColor3 = Color3.new(1, 1, 1)
+toggle.TextSize = 20
+toggle.Font = Enum.Font.SourceSansBold
+toggle.Parent = screenGui
 
-local corner = Instance.new("UICorner")
-corner.CornerRadius = UDim.new(0, 8)
-corner.Parent = main
-
-local status = Instance.new("TextLabel")
-status.Size = UDim2.new(1, -10, 0, 20)
-status.Position = UDim2.new(0, 5, 0, 5)
-status.BackgroundTransparency = 1
-status.Text = silentAim.enabled and "SILENT AIM: ACTIVE" or "SILENT AIM: INACTIVE"
-status.TextColor3 = silentAim.enabled and Color3.fromRGB(0, 255, 0) or Color3.fromRGB(150, 150, 150)
-status.TextScaled = true
-status.Font = Enum.Font.GothamBold
-status.Parent = main
-
-local target = Instance.new("TextLabel")
-target.Size = UDim2.new(1, -10, 0, 15)
-target.Position = UDim2.new(0, 5, 0, 30)
-target.BackgroundTransparency = 1
-target.Text = "Target: None"
-target.TextColor3 = Color3.fromRGB(200, 200, 200)
-target.TextScaled = true
-target.Font = Enum.Font.Gotham
-target.Parent = main
-
-local info = Instance.new("TextLabel")
-info.Size = UDim2.new(1, -10, 0, 12)
-info.Position = UDim2.new(0, 5, 0, 47)
-info.BackgroundTransparency = 1
-info.Text = "FOV: " .. silentAim.fov .. " | " .. string.upper(silentAim.targetPart)
-info.TextColor3 = Color3.fromRGB(150, 150, 150)
-info.TextScaled = true
-info.Font = Enum.Font.Gotham
-info.Parent = main
-
-local toggleBtn = Instance.new("TextButton")
-toggleBtn.Name = "Toggle"
-toggleBtn.Size = UDim2.new(0.45, -6, 0, 20)
-toggleBtn.Position = UDim2.new(0, 5, 0, 65)
-toggleBtn.BackgroundColor3 = Color3.fromRGB(35, 35, 35)
-toggleBtn.BorderSizePixel = 0
-toggleBtn.Text = silentAim.enabled and "ON" or "OFF"
-toggleBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
-toggleBtn.Font = Enum.Font.GothamBold
-toggleBtn.TextScaled = true
-toggleBtn.Parent = main
-
-local toggleCorner = Instance.new("UICorner")
-toggleCorner.CornerRadius = UDim.new(0, 6)
-toggleCorner.Parent = toggleBtn
-
-local sliderTrack = Instance.new("Frame")
-sliderTrack.Name = "SliderTrack"
-sliderTrack.Size = UDim2.new(0.45, -6, 0, 12)
-sliderTrack.Position = UDim2.new(0.55, 1, 0, 70)
-sliderTrack.BackgroundColor3 = Color3.fromRGB(60, 60, 60)
-sliderTrack.BorderSizePixel = 0
-sliderTrack.Parent = main
-
-local sliderCorner = Instance.new("UICorner")
-sliderCorner.CornerRadius = UDim.new(0, 6)
-sliderCorner.Parent = sliderTrack
-
-local handle = Instance.new("Frame")
-handle.Name = "Handle"
-handle.Size = UDim2.new(0, 12, 1, 0)
-handle.AnchorPoint = Vector2.new(0.5, 0.5)
-handle.Position = UDim2.new((silentAim.fov - 50) / (500 - 50), 0, 0.5, 0)
-handle.BackgroundColor3 = Color3.fromRGB(200, 200, 200)
-handle.BorderSizePixel = 0
-handle.Parent = sliderTrack
-
-local handleCorner = Instance.new("UICorner")
-handleCorner.CornerRadius = UDim.new(0, 6)
-handleCorner.Parent = handle
-
-local minLabel = Instance.new("TextLabel")
-minLabel.Size = UDim2.new(0, 20, 0, 12)
-minLabel.Position = UDim2.new(0, 0, 0, 86)
-minLabel.BackgroundTransparency = 1
-minLabel.Text = "50"
-minLabel.TextScaled = true
-minLabel.Font = Enum.Font.Gotham
-minLabel.TextColor3 = Color3.fromRGB(150, 150, 150)
-minLabel.Parent = main
-
-local maxLabel = Instance.new("TextLabel")
-maxLabel.Size = UDim2.new(0, 30, 0, 12)
-maxLabel.Position = UDim2.new(1, -30, 0, 86)
-maxLabel.BackgroundTransparency = 1
-maxLabel.Text = "500"
-maxLabel.TextScaled = true
-maxLabel.Font = Enum.Font.Gotham
-maxLabel.TextColor3 = Color3.fromRGB(150, 150, 150)
-maxLabel.Parent = main
-
-RunService.Heartbeat:Connect(function()
-    local currentTarget = getClosestTarget()
-    if currentTarget and currentTarget.Parent then
-        target.Text = "Target: " .. currentTarget.Parent.Name
-        target.TextColor3 = Color3.fromRGB(255, 100, 100)
-    else
-        target.Text = "Target: None"
-        target.TextColor3 = Color3.fromRGB(200, 200, 200)
-    end
-end)
-
-toggleBtn.MouseButton1Click:Connect(function()
-    silentAim.enabled = not silentAim.enabled
-    toggleBtn.Text = silentAim.enabled and "ON" or "OFF"
-    status.Text = silentAim.enabled and "SILENT AIM: ACTIVE" or "SILENT AIM: INACTIVE"
-    status.TextColor3 = silentAim.enabled and Color3.fromRGB(0, 255, 0) or Color3.fromRGB(150, 150, 150)
-
-    if silentAim.enabled then
+-- Master Toggle Function
+local function toggleMaster()
+    masterEnabled = not masterEnabled
+    
+    if masterEnabled then
+        toggle.Text = "ON"
+        toggle.BackgroundColor3 = Color3.fromRGB(0, 255, 0)
+        
+        -- Add skeletons for all players
         for _, pl in pairs(Players:GetPlayers()) do
-            if pl ~= LocalPlayer and pl.Character then
-                if pl.Team ~= LocalPlayer.Team then
-                    if not highlights[pl] then
-                        local hl = createHighlight(pl.Character)
-                        highlights[pl] = hl
-                    elseif highlights[pl] and highlights[pl].Parent == nil then
-                        highlights[pl].Parent = CoreGui
-                    end
+            if pl ~= player and pl.Character then
+                addSkeletonForPlayer(pl)
+            end
+        end
+        
+        -- Handle tools
+        for _, child in pairs(character:GetChildren()) do
+            handleTool(child)
+        end
+    else
+        toggle.Text = "OFF"
+        toggle.BackgroundColor3 = Color3.fromRGB(255, 0, 0)
+        
+        -- Remove all skeletons
+        for targetPlayer, skeleton in pairs(skeletons) do
+            removeSkeleton(skeleton)
+        end
+        skeletons = {}
+        
+        -- Clear selected target
+        selectedTarget = nil
+        
+        -- Clean up tools
+        maid:DoCleaning()
+    end
+end
+
+toggle.MouseButton1Click:Connect(toggleMaster)
+
+-- Simple update loop with frame limiting
+local lastUpdateTime = 0
+RunService.Heartbeat:Connect(function()
+    if masterEnabled then
+        local currentTime = tick()
+        if currentTime - lastUpdateTime >= 0.05 then -- Update every 0.05 seconds (20 FPS)
+            for _, skeleton in pairs(skeletons) do
+                if skeleton and skeleton.character and skeleton.character.Parent then
+                    updateSkeleton(skeleton)
                 end
             end
+            lastUpdateTime = currentTime
         end
-    else
-        for player, hl in pairs(highlights) do
-            if hl then
-                hl:Destroy()
-            end
-        end
-        highlights = {}
     end
 end)
 
+-- GUI Dragging
+local dragging = false
+local dragInput, dragStart, startPos
 
-
-local guiDragging = false
-local guiDragInput, guiDragStart, guiStartPos
-
-main.InputBegan:Connect(function(input)
-    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-        if sliderDragging then return end
-        guiDragging = true
-        guiDragStart = input.Position
-        guiStartPos = main.Position
-
+toggle.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 then
+        dragging = true
+        dragStart = input.Position
+        startPos = toggle.Position
+        
         input.Changed:Connect(function()
             if input.UserInputState == Enum.UserInputState.End then
-                guiDragging = false
+                dragging = false
             end
         end)
     end
 end)
 
-main.InputChanged:Connect(function(input)
-    if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
-        guiDragInput = input
+toggle.InputChanged:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseMovement then
+        dragInput = input
     end
 end)
 
 UserInputService.InputChanged:Connect(function(input)
-    if guiDragging and input == guiDragInput and guiDragStart and guiStartPos then
-        local delta = input.Position - guiDragStart
-        local newX = guiStartPos.X.Offset + delta.X
-        local newY = guiStartPos.Y.Offset + delta.Y
-
-        local viewport = workspace.CurrentCamera.ViewportSize
-        local maxX = math.max(0, viewport.X - main.AbsoluteSize.X)
-        local maxY = math.max(0, viewport.Y - main.AbsoluteSize.Y)
-
-        newX = math.clamp(newX, 0, maxX)
-        newY = math.clamp(newY, 0, maxY)
-
-        main.Position = UDim2.new(guiStartPos.X.Scale, newX, guiStartPos.Y.Scale, newY)
+    if dragging and input == dragInput then
+        local delta = input.Position - dragStart
+        toggle.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
     end
 end)
-
-sliderDragging = false
-local sliderMin, sliderMax = 50, 500
-
-local function updateSliderFromPosition(absX)
-    local trackPos = sliderTrack.AbsolutePosition
-    local trackSize = sliderTrack.AbsoluteSize
-    local relativeX = math.clamp(absX - trackPos.X, 0, trackSize.X)
-    local ratio = 0
-    if trackSize.X > 0 then
-        ratio = relativeX / trackSize.X
-    end
-    handle.Position = UDim2.new(ratio, 0, 0.5, 0)
-    local newFov = math.floor(sliderMin + ratio * (sliderMax - sliderMin))
-    silentAim.fov = newFov
-    info.Text = "FOV: " .. silentAim.fov .. " | " .. string.upper(silentAim.targetPart)
-end
-
-local function sliderInputBegan(input)
-    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-        sliderDragging = true
-        -- stop GUI drag while slider is active
-        guiDragging = false
-        local x = input.Position and input.Position.X or UserInputService:GetMouseLocation().X
-        updateSliderFromPosition(x)
-        input.Changed:Connect(function()
-            if input.UserInputState == Enum.UserInputState.End then
-                sliderDragging = false
-            end
-        end)
-    end
-end
-
-local function sliderInputChanged(input)
-    if sliderDragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
-        local x = input.Position and input.Position.X or UserInputService:GetMouseLocation().X
-        updateSliderFromPosition(x)
-    end
-end
-
-local function sliderInputEnded(input)
-    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-        sliderDragging = false
-    end
-end
-
-sliderTrack.InputBegan:Connect(sliderInputBegan)
-handle.InputBegan:Connect(sliderInputBegan)
-
-UserInputService.InputChanged:Connect(sliderInputChanged)
-UserInputService.InputEnded:Connect(sliderInputEnded)
